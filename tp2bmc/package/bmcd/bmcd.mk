@@ -11,6 +11,12 @@ BMCD_DEPENDENCIES += libopenssl
 BMCD_CARGO_ENV := PKG_CONFIG_ALLOW_CROSS=1
 BMCD_CARGO_ENV += CC_armv7_unknown_linux_gnueabi="arm-linux-gcc"
 
+# Add network configuration support (bonding) to bmcd
+define BMCD_ADD_NETWORK_CONFIG
+	python3 $(BR2_EXTERNAL_TP2BMC_PATH)/package/bmcd/add_network_config.py $(BMCD_SRCDIR)
+endef
+BMCD_POST_EXTRACT_HOOKS += BMCD_ADD_NETWORK_CONFIG
+
 # A copy of the default build commands with --path amended, because bmcd's
 # root Cargo.toml is a VIRTUAL manifest from v2.3.5 onward: `feat: split
 # board_info into seperate package` turned the repo into a workspace of
