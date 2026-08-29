@@ -1,6 +1,6 @@
 --- a/drivers/net/dsa/realtek/rtl8365mb.c
 +++ b/drivers/net/dsa/realtek/rtl8365mb.c
-@@ -309,7 +309,67 @@
+@@ -309,7 +309,90 @@
  #define   RTL8365MB_MSTI_CTRL_PORT_STATE_OFFSET(_physport) ((_physport) << 1)
  #define   RTL8365MB_MSTI_CTRL_PORT_STATE_MASK(_physport) \
  		(0x3 << RTL8365MB_MSTI_CTRL_PORT_STATE_OFFSET((_physport)))
@@ -27,7 +27,7 @@
 +#define RTL8365MB_TABLE_OP_READ                   0
 +#define RTL8365MB_TABLE_OP_WRITE                  1
 +#define RTL8365MB_TABLE_CVLAN                     3
- 
++
 +#define RTL8365MB_VLAN4K_WORDS                    3
 +#define RTL8365MB_VLAN_MAX                        4095
 +#define RTL8365MB_VLAN_PORT_MASK                  GENMASK(10, 0)
@@ -55,6 +55,21 @@
 +#define RTL8365MB_VLAN_INGRESS_REG                0x07a9
 +#define RTL8365MB_VLAN_INGRESS_MASK               GENMASK(10, 0)
 +
++/* Per-port ingress frame type filtering */
++#define RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_BASE     0x07aa
++#define RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_REG(_port) \
++        (RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_BASE + ((_port) >> 3))
++#define RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_OFFSET(_port) \
++        (((_port) & 0x7) << 1)
++#define RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_MASK(_port) \
++        (0x3 << RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_OFFSET(_port))
+ 
++enum rtl8365mb_frame_ingress {
++        RTL8365MB_FRAME_TYPE_ANY_FRAME = 0,
++        RTL8365MB_FRAME_TYPE_TAGGED_ONLY,
++        RTL8365MB_FRAME_TYPE_UNTAGGED_ONLY,
++};
++
 +/* Per-port egress tag mode */
 +#define RTL8365MB_PORT_MISC_CFG_BASE              0x000e
 +#define RTL8365MB_PORT_MISC_CFG_REG(_port)        \
@@ -64,11 +79,19 @@
 +#define RTL8365MB_VLAN_EGRESS_ORIGINAL            0
 +#define RTL8365MB_VLAN_EGRESS_KEEP                1
 +#define RTL8365MB_VLAN_EGRESS_PRIORITY            2
++#define RTL8365MB_VLAN_EGRESS_REAL_KEEP           3
++
++/* VLAN transparent matrix:
++ * one register per egress port, one bit per ingress port.
++ */
++#define RTL8365MB_VLAN_EGRESS_TRANSPARENT_BASE    0x09d0
++#define RTL8365MB_VLAN_EGRESS_TRANSPARENT_REG(_port) \
++        (RTL8365MB_VLAN_EGRESS_TRANSPARENT_BASE + (_port))
 +
  /* MIB counter value registers */
  #define RTL8365MB_MIB_COUNTER_BASE	0x1000
  #define RTL8365MB_MIB_COUNTER_REG(_x)	(RTL8365MB_MIB_COUNTER_BASE + (_x))
-@@ -662,6 +722,28 @@
+@@ -662,6 +745,28 @@
  	struct rtnl_link_stats64 stats;
  	spinlock_t stats_lock;
  	struct delayed_work mib_work;
@@ -97,11 +120,12 @@
  };
  
  /**
-@@ -681,9 +763,363 @@
+@@ -681,9 +786,400 @@
  	const struct rtl8365mb_chip_info *chip_info;
  	struct rtl8365mb_cpu cpu;
  	struct mutex mib_lock;
 +        u16 vlan_filtering_ports;
++        u16 pvid_vid[RTL8365MB_MAX_NUM_PORTS];
  	struct rtl8365mb_port ports[RTL8365MB_MAX_NUM_PORTS];
  };
 +
@@ -354,7 +378,7 @@
 +        int empty = -1;
 +        int ret;
 +        int i;
- 
++
 +        if (vid > RTL8365MB_VLAN_MAX)
 +                return -EINVAL;
 +
@@ -457,28 +481,107 @@
 +                                  RTL8365MB_VLAN_PVID_OFFSET(port));
 +}
 +
++static int rtl8365mb_port_get_framefilter(
++        struct realtek_priv *priv, int port,
++        enum rtl8365mb_frame_ingress *frame_type)
++{
++        unsigned int val;
++        int ret;
++
++        ret = regmap_read(priv->map,
++                          RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_REG(port),
++                          &val);
++        if (ret)
++                return ret;
++
++        *frame_type =
++                (val & RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_MASK(port)) >>
++                RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_OFFSET(port);
++
++        return 0;
++}
++
++static int rtl8365mb_port_set_framefilter(
++        struct realtek_priv *priv, int port,
++        enum rtl8365mb_frame_ingress frame_type)
++{
++        unsigned int val;
++
++        val = frame_type <<
++              RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_OFFSET(port);
++
++        return regmap_update_bits(
++                priv->map,
++                RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_REG(port),
++                RTL8365MB_VLAN_ACCEPT_FRAME_TYPE_MASK(port),
++                val);
++}
+ 
 +
  static int rtl8365mb_phy_poll_busy(struct realtek_priv *priv)
  {
  	u32 val;
-@@ -1326,7 +1762,213 @@
+@@ -1312,21 +1808,337 @@
+ 	/* Make sure the CPU is included in every bridge */
+ 	bridge_mask = cpu_mask;
+ 
+-	for (int i = 0; i < priv->num_ports; i++) {
+-		if (dsa_port_offloads_bridge(dsa_to_port(priv->ds, i), bridge))
+-			bridge_mask |= BIT(i);
++	for (int n = 0; n < priv->num_ports; n++) {
++	        bool member;
++
++	        member = dsa_port_offloads_bridge(dsa_to_port(priv->ds, n),
++	                                          bridge);
++
++	        if (member)
++	                bridge_mask |= BIT(n);
+ 	}
+ 
+ 	/* Don't set the CPU port's isolation; it's bypassed anyway */
+ 	for_each_andnot_bit(port, &bridge_mask, &cpu_mask, priv->num_ports) {
+-		ret = rtl8365mb_port_set_isolation(priv, port, bridge_mask);
++	        ret = rtl8365mb_port_set_isolation(priv, port, bridge_mask);
+ 		if (ret)
+ 			return ret;
+ 	}
  
  	return 0;
- }
++}
 +
 +static int rtl8365mb_port_vlan_del(struct dsa_switch *ds, int port,
 +                                   const struct switchdev_obj_port_vlan *vlan)
 +{
 +        struct realtek_priv *priv = ds->priv;
 +        struct rtl8365mb *mb = (struct rtl8365mb *)priv->chip_data;
++        bool deleting_pvid = mb->pvid_vid[port] == vlan->vid;
 +        struct rtl8365mb_vlan4k vlan4k;
 +        struct rtl8365mb_vlan_mc vlanmc;
 +        u8 pvid_index;
 +        u8 mc_index;
 +        int ret;
- 
++
 +        if (vlan->vid > RTL8365MB_VLAN_MAX)
 +                return -EINVAL;
++
++        if (deleting_pvid) {
++                enum rtl8365mb_frame_ingress frame_type;
++
++                frame_type = (mb->vlan_filtering_ports & BIT(port)) ?
++                        RTL8365MB_FRAME_TYPE_TAGGED_ONLY :
++                        RTL8365MB_FRAME_TYPE_ANY_FRAME;
++
++                ret = rtl8365mb_port_set_framefilter(priv, port, frame_type);
++                if (ret)
++                        return ret;
++
++                ret = rtl8365mb_port_pvid_set(priv, port, 0);
++                if (ret)
++                        return ret;
++
++                mb->pvid_vid[port] = 0;
++
++        }
 +
 +        ret = rtl8365mb_vlan4k_read(priv, vlan->vid, &vlan4k);
 +        if (ret)
@@ -584,6 +687,8 @@
 +        else
 +                vlan4k.untag &= ~BIT(port);
 +
++        vlan4k.ivl = true;
++
 +        ret = rtl8365mb_vlan4k_write(priv, &vlan4k);
 +        if (ret)
 +                return ret;
@@ -616,6 +721,14 @@
 +                ret = rtl8365mb_port_pvid_set(priv, port, mc_index);
 +                if (ret)
 +                        return ret;
++
++                ret = rtl8365mb_port_set_framefilter(
++                        priv, port, RTL8365MB_FRAME_TYPE_ANY_FRAME);
++                if (ret)
++                        return ret;
++
++                mb->pvid_vid[port] = vlan->vid;
++
 +        }
 +
 +        dev_dbg(priv->dev,
@@ -625,6 +738,31 @@
 +                vlan->flags & BRIDGE_VLAN_INFO_UNTAGGED ? " untagged" : "");
 +
 +        return 0;
+ }
+ 
++
++static int rtl8365mb_port_set_transparent(struct realtek_priv *priv,
++                                           int ingress_port,
++                                           int egress_port,
++                                           bool enable)
++{
++        return regmap_update_bits(
++                priv->map,
++                RTL8365MB_VLAN_EGRESS_TRANSPARENT_REG(egress_port),
++                BIT(ingress_port),
++                enable ? BIT(ingress_port) : 0);
++}
++
++static int rtl8365mb_port_set_vlan_egress_mode(struct realtek_priv *priv,
++                                                int port,
++                                                u16 mode)
++{
++        u16 val = mode << 4;
++
++        return regmap_update_bits(priv->map,
++                                  RTL8365MB_PORT_MISC_CFG_REG(port),
++                                  RTL8365MB_VLAN_EGRESS_MODE_MASK,
++                                  val);
 +}
 +
 +
@@ -634,17 +772,28 @@
 +{
 +        struct realtek_priv *priv = ds->priv;
 +        struct rtl8365mb *mb = (struct rtl8365mb *)priv->chip_data;
-+        u16 old_ports = mb->vlan_filtering_ports;
-+        u16 new_ports;
++        enum rtl8365mb_frame_ingress accepted_frame;
++        enum rtl8365mb_frame_ingress prev_accepted_frame;
++        struct dsa_port *dp;
++        u16 configured_ports = 0;
++        u16 mode;
 +        int ret;
 +
-+        if (vlan_filtering)
-+                new_ports = old_ports | BIT(port);
-+        else
-+                new_ports = old_ports & ~BIT(port);
++        ret = rtl8365mb_port_get_framefilter(priv, port,
++                                             &prev_accepted_frame);
++        if (ret)
++                return ret;
 +
-+        dev_dbg(priv->dev, "port %d: %s VLAN filtering\n",
-+                port, vlan_filtering ? "enable" : "disable");
++        /*
++         * While VLAN filtering is active, a port without a Linux PVID
++         * must only accept tagged frames. A port with a PVID accepts
++         * both tagged and untagged traffic; untagged traffic is then
++         * classified into that PVID by the switch.
++         */
++        if (vlan_filtering && !mb->pvid_vid[port])
++                accepted_frame = RTL8365MB_FRAME_TYPE_TAGGED_ONLY;
++        else
++                accepted_frame = RTL8365MB_FRAME_TYPE_ANY_FRAME;
 +
 +        ret = regmap_update_bits(priv->map,
 +                                 RTL8365MB_VLAN_INGRESS_REG,
@@ -653,29 +802,124 @@
 +        if (ret)
 +                return ret;
 +
-+        ret = regmap_update_bits(priv->map,
-+                                 RTL8365MB_VLAN_CTRL_REG,
-+                                 RTL8365MB_VLAN_CTRL_ENABLE,
-+                                 new_ports ?
-+                                 RTL8365MB_VLAN_CTRL_ENABLE : 0);
-+        if (ret) {
-+                regmap_update_bits(priv->map,
-+                                   RTL8365MB_VLAN_INGRESS_REG,
-+                                   BIT(port),
-+                                   old_ports & BIT(port));
-+                return ret;
++        dsa_switch_for_each_available_port(dp, ds) {
++                ret = rtl8365mb_port_set_transparent(priv,
++                                                      port,
++                                                      dp->index,
++                                                      !vlan_filtering);
++                if (ret)
++                        goto rollback_transparent;
++
++                configured_ports |= BIT(dp->index);
 +        }
 +
-+        mb->vlan_filtering_ports = new_ports;
++        if (accepted_frame != prev_accepted_frame) {
++                ret = rtl8365mb_port_set_framefilter(priv, port,
++                                                     accepted_frame);
++                if (ret)
++                        goto rollback_transparent;
++        }
++
++        mode = vlan_filtering ?
++                RTL8365MB_VLAN_EGRESS_ORIGINAL :
++                RTL8365MB_VLAN_EGRESS_REAL_KEEP;
++
++        ret = rtl8365mb_port_set_vlan_egress_mode(priv, port, mode);
++        if (ret)
++                goto rollback_framefilter;
++
++        if (vlan_filtering)
++                mb->vlan_filtering_ports |= BIT(port);
++        else
++                mb->vlan_filtering_ports &= ~BIT(port);
 +
 +        return 0;
++
++rollback_framefilter:
++        if (accepted_frame != prev_accepted_frame)
++                rtl8365mb_port_set_framefilter(priv, port,
++                                               prev_accepted_frame);
++
++rollback_transparent:
++        dsa_switch_for_each_port(dp, ds) {
++                if (!(configured_ports & BIT(dp->index)))
++                        continue;
++
++                rtl8365mb_port_set_transparent(priv,
++                                               port,
++                                               dp->index,
++                                               vlan_filtering);
++        }
++
++        regmap_update_bits(priv->map,
++                           RTL8365MB_VLAN_INGRESS_REG,
++                           BIT(port),
++                           vlan_filtering ? 0 : BIT(port));
++
++        return ret;
 +}
 +
 +
  static int rtl8365mb_port_bridge_join(struct dsa_switch *ds, int port,
  				      struct dsa_bridge bridge,
  				      bool *tx_fwd_offload,
-@@ -2278,6 +2920,9 @@
+@@ -2078,7 +2890,37 @@
+ 					!(val & RTL8365MB_CHIP_RESET_HW_MASK),
+ 					20000, 1e6);
+ }
++
++static int rtl8365mb_vlan_setup(struct dsa_switch *ds)
++{
++        struct realtek_priv *priv = ds->priv;
++        struct dsa_port *dp;
++        int ret;
++
++        dsa_switch_for_each_available_port(dp, ds) {
++                ret = rtl8365mb_port_vlan_filtering(ds, dp->index,
++                                                    false, NULL);
++                if (ret) {
++                        dev_err(priv->dev,
++                                "failed to disable VLAN filtering on port %d: %d\n",
++                                dp->index, ret);
++                        return ret;
++                }
++        }
+ 
++        ret = regmap_update_bits(priv->map,
++                                 RTL8365MB_VLAN_CTRL_REG,
++                                 RTL8365MB_VLAN_CTRL_ENABLE,
++                                 RTL8365MB_VLAN_CTRL_ENABLE);
++        if (ret)
++                return ret;
++
++        dev_dbg(priv->dev, "global VLAN engine enabled\n");
++
++        return 0;
++}
++
++
+ static int rtl8365mb_setup(struct dsa_switch *ds)
+ {
+ 	struct realtek_priv *priv = ds->priv;
+@@ -2125,7 +2967,17 @@
+ 	ret = rtl8365mb_cpu_config(priv);
+ 	if (ret)
+ 		goto out_teardown_irq;
++
++   /* VLAN support is always enabled in hardware. Per-port filtering is
++    * controlled separately by rtl8365mb_port_vlan_filtering().
++    */
++   ret = rtl8365mb_vlan_setup(ds);
++   if (ret) {
++           dev_err(priv->dev, "failed to initialize VLAN support: %d\n", ret);
++           goto out_teardown_irq;
++   }
+ 
++
+ 	/* Configure ports */
+ 	for (i = 0; i < priv->num_ports; i++) {
+ 		struct rtl8365mb_port *p = &mb->ports[i];
+@@ -2278,6 +3130,9 @@
  	.port_max_mtu = rtl8365mb_port_max_mtu,
  	.port_bridge_join = rtl8365mb_port_bridge_join,
  	.port_bridge_leave = rtl8365mb_port_bridge_leave,
@@ -685,7 +929,7 @@
  };
  
  static const struct dsa_switch_ops rtl8365mb_switch_ops_mdio = {
-@@ -2303,6 +2948,9 @@
+@@ -2303,6 +3158,9 @@
  	.port_max_mtu = rtl8365mb_port_max_mtu,
  	.port_bridge_join = rtl8365mb_port_bridge_join,
  	.port_bridge_leave = rtl8365mb_port_bridge_leave,
