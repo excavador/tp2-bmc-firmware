@@ -7,4 +7,7 @@ wip
 tmp
 dl
 .ccache
+# HOME for the containerised local build (docker run -e HOME=/work/.home):
+# cargo registry, ccache config and friends land here.
+.home
 ccache-stats.txt
